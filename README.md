@@ -1,6 +1,44 @@
-# Chrome DevTools for Agents
+# Chrome DevTools MCP (Parallel)
 
-[![npm chrome-devtools-mcp package](https://img.shields.io/npm/v/chrome-devtools-mcp.svg)](https://npmjs.org/package/chrome-devtools-mcp)
+[![npm chrome-devtools-mcp-parallel package](https://img.shields.io/npm/v/chrome-devtools-mcp-parallel.svg)](https://npmjs.org/package/chrome-devtools-mcp-parallel)
+
+> Fork of [`chrome-devtools-mcp`](https://github.com/ChromeDevTools/chrome-devtools-mcp) that adds parallel multi-instance browser support.
+
+## Parallel Mode
+
+Run multiple isolated Chrome instances from a single MCP server process. Each
+tool call takes an `instanceId` argument; launch mode (auto-spawn) and CDP mode
+(reuse a running Chrome via `--remote-debugging-port=9222`) are both supported.
+
+Drop-in config:
+
+```json
+{
+  "mcpServers": {
+    "chrome-devtools-mcp": {
+      "command": "npx",
+      "args": ["-y", "chrome-devtools-mcp-parallel@latest", "--headless", "--isolated", "--max-instances", "5"]
+    }
+  }
+}
+```
+
+Binaries shipped:
+
+- `chrome-devtools-mcp-parallel` — parallel multi-instance server (recommended).
+- `chrome-devtools-mcp` — upstream single-instance server, unchanged.
+- `chrome-devtools` — upstream CLI.
+
+See [`specs/001-parallel-instances/quickstart.md`](./specs/001-parallel-instances/quickstart.md)
+for the 5-minute tour and [`PUBLISH.md`](./PUBLISH.md) for release instructions.
+
+---
+
+## Upstream README
+
+The rest of this document is inherited from upstream `chrome-devtools-mcp`.
+Wherever you see `chrome-devtools-mcp@latest` you can substitute
+`chrome-devtools-mcp-parallel@latest` to get the parallel-enabled fork.
 
 Chrome DevTools for Agents (`chrome-devtools-mcp`) lets your coding agent (such as Gemini, Claude, Cursor or Copilot)
 control and inspect a live Chrome browser. It acts as a Model-Context-Protocol

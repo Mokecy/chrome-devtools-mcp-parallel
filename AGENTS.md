@@ -1,4 +1,4 @@
-This repository contains an MCP server and CLI for Chrome DevTools.
+﻿This repository contains an MCP server and CLI for Chrome DevTools.
 
 # Instructions
 
