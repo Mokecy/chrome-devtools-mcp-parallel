@@ -22,6 +22,49 @@ import type {InstanceRegistry} from './InstanceRegistry.js';
 import {processSnapshot} from './SnapshotEnhancer.js';
 import type {ParallelServerArgs} from './types.js';
 
+/**
+ * Internal soft timeout (ms) for the upstream handler + response.handle().
+ * Kept below the typical MCP client timeout (60s) so we can return a
+ * meaningful error and release the per-instance mutex instead of letting the
+ * client time out and the server keep the page busy.
+ */
+const HANDLER_SOFT_TIMEOUT_MS = 55_000;
+
+/** Tools that frequently produce huge payloads on heavy pages. */
+const HEAVY_PAYLOAD_TOOLS = new Set<string>(['take_snapshot', 'take_screenshot']);
+
+class HandlerTimeoutError extends Error {
+  constructor(toolName: string, ms: number) {
+    super(
+      `Tool "${toolName}" exceeded ${ms}ms internal timeout. ` +
+        (HEAVY_PAYLOAD_TOOLS.has(toolName)
+          ? 'Try passing a "filePath" to save the result to disk, ' +
+            'or set "verbose: false" for snapshots on large pages.'
+          : 'The page may be unresponsive; consider page_close_page or instance_close.'),
+    );
+    this.name = 'HandlerTimeoutError';
+  }
+}
+
+function withTimeout<T>(p: Promise<T>, ms: number, toolName: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(
+      () => reject(new HandlerTimeoutError(toolName, ms)),
+      ms,
+    );
+    p.then(
+      v => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      e => {
+        clearTimeout(timer);
+        reject(e);
+      },
+    );
+  });
+}
+
 export interface DerivedToolInfo {
   name: string;
   description: string;
@@ -133,17 +176,25 @@ export function derivePageTool(
         ctx: typeof context,
       ) => Promise<void> = upstream.handler;
       try {
-        if ('pageScoped' in upstream && upstream.pageScoped) {
-          await handler({params: upstreamParams, page}, response, context);
-        } else {
-          await handler({params: upstreamParams}, response, context);
-        }
+        const exec = (async () => {
+          if ('pageScoped' in upstream && upstream.pageScoped) {
+            await handler({params: upstreamParams, page}, response, context);
+          } else {
+            await handler({params: upstreamParams}, response, context);
+          }
+        })();
+        await withTimeout(exec, HANDLER_SOFT_TIMEOUT_MS, upstream.name);
       } catch (err) {
         response.setError(err);
       }
 
-      // Step 6: generate result
-      const handleResult = await response.handle(upstream.name, context);
+      // Step 6: generate result (also bounded so a slow snapshot/network
+      // collection cannot hang the per-instance mutex past the client timeout).
+      const handleResult = await withTimeout(
+        response.handle(upstream.name, context),
+        HANDLER_SOFT_TIMEOUT_MS,
+        upstream.name,
+      );
       const result: CallToolResult = {content: handleResult.content};
       if (response.error) {
         result.isError = true;
