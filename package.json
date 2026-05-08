@@ -1,6 +1,6 @@
 {
   "name": "chrome-devtools-mcp-parallel",
-  "version": "0.25.0",
+  "version": "0.25.1",
   "description": "Chrome DevTools MCP with parallel multi-instance browser support. Drop-in enhancement over chrome-devtools-mcp.",
   "keywords": [
     "chrome",
