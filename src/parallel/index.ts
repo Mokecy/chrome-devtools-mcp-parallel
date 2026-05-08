@@ -119,6 +119,12 @@ export async function createParallelMcpServer(
           .describe(
             'Use CDP mode (connected browser). Falls back to launch if unavailable.',
           ),
+        permissions: zod
+          .record(zod.string(), zod.array(zod.string()))
+          .optional()
+          .describe(
+            'Map of origin -> array of W3C permission names to grant (e.g. {"https://map.baidu.com": ["geolocation"]}). Pass empty array to deny all. Names must come from puppeteer Permission type; native Chrome UI prompts (device discovery, hid) cannot be suppressed via this option — use --chrome-arg flags instead.',
+          ),
       },
       annotations: {
         title: 'Create Instance',
@@ -130,6 +136,7 @@ export async function createParallelMcpServer(
       url?: string;
       cloneAuth?: boolean;
       useCDP?: boolean;
+      permissions?: Record<string, string[]>;
     }): Promise<CallToolResult> => {
       const release = await mutex.acquire(undefined);
       try {
@@ -139,6 +146,7 @@ export async function createParallelMcpServer(
             url: params.url,
             cloneAuth: params.cloneAuth,
             useCDP: params.useCDP,
+            permissions: params.permissions,
           },
           {registry, serverArgs: args, connectedBrowser, authStateHolder},
         );

@@ -23,11 +23,22 @@ import type {InstanceRegistry} from '../InstanceRegistry.js';
 import {PerInstance} from '../PerInstance.js';
 import type {ParallelServerArgs, ConnectedBrowser} from '../types.js';
 
+/**
+ * Origin -> permission name list. Permission names follow puppeteer's
+ * `Permission` type (W3C web permissions). Pass an empty array to deny all.
+ *
+ * Note: Chrome native UI prompts that don't map to a W3C permission name
+ * (device discovery, hid, etc.) cannot be suppressed via this API. For those,
+ * pass extra `--chrome-arg=...` flags when starting the MCP server.
+ */
+export type PermissionOverrides = Record<string, string[]>;
+
 export interface InstanceCreateParams {
   instanceId: string;
   url?: string;
   cloneAuth?: boolean;
   useCDP?: boolean;
+  permissions?: PermissionOverrides;
 }
 
 export interface InstanceCreateDeps {
@@ -190,6 +201,36 @@ export async function instanceCreate(
       lines.push(
         'useCDP requested but no connected browser, fell back to launch',
       );
+    }
+
+    // Apply permission overrides (best-effort).
+    // Permissions outside puppeteer's W3C set will throw; we report and skip.
+    if (params.permissions) {
+      const ctxAny = instance.context as unknown as {
+        overridePermissions?: (origin: string, perms: string[]) => Promise<void>;
+      };
+      if (typeof ctxAny.overridePermissions === 'function') {
+        for (const [origin, perms] of Object.entries(params.permissions)) {
+          try {
+            await ctxAny.overridePermissions(origin, perms);
+            lines.push(
+              perms.length === 0
+                ? `Permissions denied for ${origin}.`
+                : `Permissions granted for ${origin}: ${perms.join(', ')}.`,
+            );
+          } catch (permErr) {
+            const reason =
+              permErr instanceof Error ? permErr.message : String(permErr);
+            lines.push(
+              `Permission override failed for ${origin}: ${reason} (unsupported permission name? See puppeteer Permission type)`,
+            );
+          }
+        }
+      } else {
+        lines.push(
+          'permissions parameter ignored: BrowserContext.overridePermissions not available in this puppeteer build',
+        );
+      }
     }
 
     // Navigate if url provided

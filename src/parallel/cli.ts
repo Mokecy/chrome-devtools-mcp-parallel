@@ -43,7 +43,42 @@ export function parseParallelArguments(
 ): ParallelServerArgs {
   const allOptions = {...cliOptions, ...parallelOptions};
 
-  const parsed = yargs(hideBin(argv))
+  // Pre-parse argv to reconstruct chrome-arg values verbatim. yargs splits
+  // array options on commas which breaks `--chrome-arg=--disable-features=A,B`.
+  // We extract the raw values here and inject them after parsing.
+  const rawChromeArgs: string[] = [];
+  const rawIgnoreArgs: string[] = [];
+  const cleanedArgv: string[] = [];
+  const argvNoBin = hideBin(argv);
+  for (let i = 0; i < argvNoBin.length; i++) {
+    const a = argvNoBin[i];
+    const captureInto = (target: string[], rest: string | undefined) => {
+      if (rest !== undefined) {
+        target.push(rest);
+      } else if (i + 1 < argvNoBin.length) {
+        target.push(argvNoBin[++i]);
+      }
+    };
+    if (a === '--chrome-arg' || a.startsWith('--chrome-arg=')) {
+      captureInto(rawChromeArgs, a.startsWith('--chrome-arg=') ? a.slice('--chrome-arg='.length) : undefined);
+      continue;
+    }
+    if (
+      a === '--ignore-default-chrome-arg' ||
+      a.startsWith('--ignore-default-chrome-arg=')
+    ) {
+      captureInto(
+        rawIgnoreArgs,
+        a.startsWith('--ignore-default-chrome-arg=')
+          ? a.slice('--ignore-default-chrome-arg='.length)
+          : undefined,
+      );
+      continue;
+    }
+    cleanedArgv.push(a);
+  }
+
+  const parsed = yargs(cleanedArgv)
     .scriptName('npx chrome-devtools-mcp-parallel@latest')
     .options(allOptions)
     .check(args => {
@@ -82,12 +117,18 @@ export function parseParallelArguments(
     .strict()
     .parseSync();
 
-  // Construct ParallelServerArgs from parsed values.
-  // yargs guarantees defaults are filled. We access fields by name to
-  // maintain type safety without `as`.
-  return {
+  // Inject preserved chrome-arg / ignore-default-chrome-arg values, replacing
+  // anything yargs put there (which may have been comma-split).
+  const finalArgs: ParallelServerArgs = {
     ...parsed,
     maxInstances: (parsed.maxInstances ?? 10) satisfies number,
     autoLaunch: (parsed.autoLaunch ?? true) satisfies boolean,
   } satisfies ParallelServerArgs;
+  if (rawChromeArgs.length > 0) {
+    finalArgs.chromeArg = rawChromeArgs;
+  }
+  if (rawIgnoreArgs.length > 0) {
+    finalArgs.ignoreDefaultChromeArg = rawIgnoreArgs;
+  }
+  return finalArgs;
 }
