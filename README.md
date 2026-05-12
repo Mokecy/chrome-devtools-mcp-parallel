@@ -17,7 +17,14 @@ Drop-in config:
   "mcpServers": {
     "chrome-devtools-mcp": {
       "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp-parallel@latest", "--headless", "--isolated", "--max-instances", "5"]
+      "args": [
+        "-y",
+        "chrome-devtools-mcp-parallel@latest",
+        "--headless",
+        "--isolated",
+        "--max-instances",
+        "5"
+      ]
     }
   }
 }
@@ -31,6 +38,26 @@ Binaries shipped:
 
 See [`specs/001-parallel-instances/quickstart.md`](./specs/001-parallel-instances/quickstart.md)
 for the 5-minute tour and [`PUBLISH.md`](./PUBLISH.md) for release instructions.
+
+### Stability Hardening (since v0.25)
+
+The parallel server ships a coordinated stability program: bounded ring
+buffers for console / network records, on-disk persistence for large
+artifacts (screenshots, traces, heap snapshots), structured error codes
+on instance crashes, an automatic 4 GB heap floor, OOM forensic logging,
+and observability tooling. **Defaults are safe out of the box** — most
+users do not need to tune anything. Detailed reference:
+
+- 📋 [Migration guide](./specs/001-stability-hardening/migration.md) —
+  every default that changed, every field added, and how to opt back in.
+- 🧱 [Data model](./specs/001-stability-hardening/data-model.md) —
+  runtime entities (Instance state machine, RingBuffer, Artifact,
+  StructuredError, MemorySample, ObservabilitySnapshot, …).
+- 📝 [Tool contracts](./specs/001-stability-hardening/contracts/) — I/O
+  schemas + error codes for the new management tools (`instance_health`,
+  `instance_recreate`, `page_artifact_read_summary`, `system_observe`).
+- 📊 [Memory & Heap](#memory--heap) section below for the heap respawn +
+  memory monitor knobs.
 
 ---
 
@@ -123,7 +150,12 @@ If you are interested in doing only basic browser tasks, use the `--slim` mode:
   "mcpServers": {
     "chrome-devtools": {
       "command": "npx",
-      "args": ["-y", "chrome-devtools-mcp-parallel@latest", "--slim", "--headless"]
+      "args": [
+        "-y",
+        "chrome-devtools-mcp-parallel@latest",
+        "--slim",
+        "--headless"
+      ]
     }
   }
 }
@@ -697,6 +729,80 @@ The Chrome DevTools MCP server supports the following configuration option:
   - **Default:** `false`
 
 <!-- END AUTO GENERATED OPTIONS -->
+
+## Memory & Heap
+
+The parallel server applies a few heap-related defaults so long-running
+sessions (multi-instance soak tests, big DOM snapshots, hour-long traces)
+don't trip V8's stock ~1.5 GB heap cap. You almost never need to change
+these — they're documented mostly for operators investigating crash logs.
+
+### Defaults
+
+| Setting                     | Default                   | Override                                            |
+| --------------------------- | ------------------------- | --------------------------------------------------- |
+| Node `--max-old-space-size` | **4096 MB**               | `--heap-size <MB>` (CLI) > `CDM_HEAP_SIZE_MB` (env) |
+| Memory sampling interval    | 60 s                      | `--mem-sample-interval-sec <N>`                     |
+| Warn threshold              | 80 % of `heap_size_limit` | `--mem-warn-pct <N>`                                |
+| Danger threshold            | 95 % of `heap_size_limit` | `--mem-danger-pct <N>`                              |
+
+### Heap self-respawn (FR-019)
+
+On boot the server inspects `v8.getHeapStatistics().heap_size_limit`. If it
+sits below the resolved heap target, the entry script re-execs itself as a
+child process with `NODE_OPTIONS="--max-old-space-size=<resolvedMB>"` and
+exits with the child's status code. A `CDM_HEAP_RESPAWNED=1` env var marks
+the child so we never recurse. To opt out, pass an explicit `--heap-size`
+matching what your launcher already configures.
+
+### Memory monitor (FR-022)
+
+Once a minute (configurable) the server samples `process.memoryUsage()` +
+`v8.getHeapStatistics()`:
+
+- **Warn band** (≥ warnPct): one stderr line per _rising_ edge:
+  `[MemoryMonitor][WARN] heap 82.4% (used=3.4GB / limit=4.0GB, rss=4.1GB)`.
+  A best-effort `global.gc?.()` runs if Node was launched with `--expose-gc`.
+- **Danger band** (≥ dangerPct): every tick prints
+  `[MemoryMonitor][DANGER] heap 96.1% — closing idle resources` and the
+  server proactively closes one idle (state=`ready`, no in-flight tool
+  call) instance to reclaim heap.
+
+The last 60 samples are kept in a ring buffer; the crash logger snapshots
+them on its way out (see below).
+
+### Physical-memory clamp (FR-021)
+
+If the resolved heap exceeds 75 % of total system memory the server clamps
+it to that ceiling and prints a single warning to stderr:
+
+```
+[HeapSelfRespawn] requested heap 8192MB exceeds physical-memory safety ratio;
+                  clamping to 6144MB (total=8192MB)
+```
+
+### Crash log (FR-023 / SC-008)
+
+A process-level handler installed at boot writes a structured JSON record
+to `<artifactDir>/crashes/<ISO>.log` for every `uncaughtException` /
+`unhandledRejection`, then the runtime exits with code 1. Each record
+contains:
+
+```json
+{
+  "ts": "2026-...",
+  "kind": "uncaughtException",
+  "error": { "message": "...", "stack": "...", "name": "RangeError" },
+  "activeInstances": [ ...InstanceHealthSnapshot ],
+  "memorySamples":   [ ...MemorySample (last 60) ],
+  "recentToolCalls": [ ...ToolCallRecord (last 20) ]
+}
+```
+
+`<artifactDir>` is `--artifact-dir` when set, otherwise the per-pid
+ephemeral slot under the OS tmpdir. Forensics tip: open the file, grep
+`heapPct` to see the trajectory leading to the crash, and `recentToolCalls`
+for the last operations the server was working on.
 
 Pass them via the `args` property in the JSON configuration. For example:
 

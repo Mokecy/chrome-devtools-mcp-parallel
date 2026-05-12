@@ -39,6 +39,7 @@
     "verify-npm-package": "node scripts/verify-npm-package.mjs",
     "eval": "npm run build && node --experimental-strip-types scripts/eval_gemini.ts",
     "count-tokens": "node --experimental-strip-types scripts/count_tokens.ts",
+    "soak-8h": "npm run build && node --experimental-strip-types --no-warnings=ExperimentalWarning scripts/soak-8h.ts",
     "prepublishOnly": "npm run bundle",
     "release:patch": "npm version patch && git push && git push --tags",
     "release:minor": "npm version minor && git push && git push --tags",

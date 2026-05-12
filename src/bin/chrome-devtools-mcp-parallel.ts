@@ -37,11 +37,24 @@ if (major < 20) {
 }
 
 import {parseParallelArguments} from '../parallel/cli.js';
+import {ensureHeapHeadroom} from '../parallel/HeapSelfRespawn.js';
 import {createParallelMcpServer} from '../parallel/index.js';
 import {VERSION} from '../version.js';
 
 async function main() {
   const args = parseParallelArguments(VERSION);
+
+  // FR-019 — boot-time heap self-check. If the live V8 heap_size_limit is
+  // below the configured floor (default 4 GB), respawn ourselves with the
+  // proper `--max-old-space-size` and exit. Skipped automatically on the
+  // child invocation via `CDM_HEAP_RESPAWNED=1`.
+  const heap = ensureHeapHeadroom({cliHeapSizeMb: args.heapSize});
+  if (heap.outcome === 'respawned') {
+    // The spawnFn `exit` handlers will terminate this process when the
+    // child exits. Bail out of `main` so we don't double-start the server.
+    return;
+  }
+
   const handle = await createParallelMcpServer(args);
 
   // Graceful shutdown on SIGINT/SIGTERM

@@ -77,6 +77,20 @@ export const listConsoleMessages = definePageTool(cliArgs => {
         .describe(
           'Set to true to return the preserved messages over the last 3 navigations.',
         ),
+      since: zod
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe(
+          'Epoch milliseconds (`Date.now()`). When set, only messages collected at or after this instant are returned. FR-004.',
+        ),
+      level: zod
+        .array(zod.enum(['error', 'warn', 'info', 'debug', 'log']))
+        .optional()
+        .describe(
+          'High-level severity filter, expanded into the underlying ConsoleMessage types and unioned with `types`. FR-004.',
+        ),
     },
     blockedByDialog: false,
     handler: async (request, response) => {
@@ -85,6 +99,8 @@ export const listConsoleMessages = definePageTool(cliArgs => {
         pageIdx: request.params.pageIdx,
         types: request.params.types,
         includePreservedMessages: request.params.includePreservedMessages,
+        since: request.params.since,
+        level: request.params.level,
       });
     },
   };

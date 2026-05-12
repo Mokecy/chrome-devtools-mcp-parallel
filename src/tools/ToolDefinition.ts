@@ -117,6 +117,20 @@ export interface Response {
     nodes: DevTools.HeapSnapshotModel.HeapSnapshotModel.ItemsRange,
     options?: PaginationOptions,
   ): void;
+  setHeapSnapshotPersistence(data: {
+    filePath: string;
+    sizeBytes: number;
+    topNodeKinds: Array<{kind: string; count: number}>;
+  }): void;
+  setTracePersistence(data: {
+    filePath: string;
+    sizeBytes: number;
+    summary: {
+      events: number;
+      samplingWindowMs: number;
+      coreMetrics: {lcpMs?: number; clsScore?: number; inpMs?: number};
+    };
+  }): void;
   setIncludePages(value: boolean): void;
   setIncludeNetworkRequests(
     value: boolean,
@@ -124,6 +138,7 @@ export interface Response {
       resourceTypes?: string[];
       includePreservedRequests?: boolean;
       networkRequestIdInDevToolsUI?: number;
+      since?: number;
     },
   ): void;
   setIncludeConsoleData(
@@ -131,6 +146,8 @@ export interface Response {
     options?: PaginationOptions & {
       types?: string[];
       includePreservedMessages?: boolean;
+      since?: number;
+      level?: string[];
     },
   ): void;
   includeSnapshot(params?: SnapshotParams): void;

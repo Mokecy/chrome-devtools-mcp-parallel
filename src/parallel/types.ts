@@ -59,6 +59,39 @@ export interface ConnectedBrowser {
 }
 
 // ---------- §2 Instance ----------
+/**
+ * Instance lifecycle state machine (FR-012). Allowed transitions:
+ *   ready        → reconnecting | dead
+ *   reconnecting → ready | dead
+ *   dead         → (terminal — only `instance_recreate` can replace it)
+ */
+export type InstanceState = 'ready' | 'reconnecting' | 'dead';
+
+/**
+ * Snapshot of how an instance was originally launched, used by the watchdog
+ * to respawn the browser process when CDP reconnects fail (FR-014).
+ * `null` for cdp-mode instances that attached to an externally managed
+ * browser; in that case the watchdog falls back to CDP-only reconnect.
+ */
+export interface InstanceLaunchConfig {
+  readonly executablePath?: string;
+  readonly userDataDir?: string;
+  readonly args: readonly string[];
+  readonly headless: boolean;
+  readonly downloadPath: string;
+}
+
+export interface InstanceHealthSnapshot {
+  readonly id: string;
+  readonly mode: InstanceMode;
+  readonly state: InstanceState;
+  readonly lastError: string | null;
+  readonly lastHealthyAt: string; // ISO timestamp
+  readonly reconnectAttempts: number;
+  readonly spawnedByService: boolean;
+  readonly createdAt: string;
+}
+
 export interface Instance {
   readonly id: string;
   readonly mode: InstanceMode;
@@ -70,9 +103,27 @@ export interface Instance {
   readonly badgeInjected: WeakSet<Page>;
   prevSnapshot: string | null;
   prevSnapshotOrigin: string | null;
+  /** Derived from `state === 'ready'` (FR-012). */
   available: boolean;
   mcpContext: McpContext;
   readonly createdAt: Date;
+
+  // Stability hardening (FR-012..018)
+  readonly state: InstanceState;
+  readonly lastError: string | null;
+  readonly lastHealthyAt: Date;
+  readonly reconnectAttempts: number;
+  readonly spawnedByService: boolean;
+  readonly launchConfig: InstanceLaunchConfig | null;
+
+  /**
+   * Transition the state machine. Throws on illegal transitions.
+   * Increments `reconnectAttempts` when entering `reconnecting`; resets
+   * the counter and updates `lastHealthyAt` when entering `ready`.
+   */
+  setState(next: InstanceState, lastError?: Error | string | null): void;
+  snapshotHealth(): InstanceHealthSnapshot;
+
   close(): Promise<void>;
   markUnavailable(): void;
   markAvailable(): void;
@@ -96,9 +147,39 @@ export interface DerivedTool<Schema extends zod.ZodRawShape = zod.ZodRawShape> {
 // ---------- ParallelServerArgs ----------
 /**
  * Extends upstream `ParsedArguments` with parallel-specific knobs.
- * Fields align with tasks T011 / T023.
+ * Fields align with tasks T011 / T023 (parallel) + 001-stability-hardening
+ * tasks T005 / T019 / T038 / T059 / T070.
  */
 export interface ParallelServerArgs extends ParsedArguments {
   maxInstances: number;
   autoLaunch: boolean;
+
+  // Stability hardening — buffer / log management (FR-001..005)
+  consoleBufferSize: number;
+  networkBufferSize: number;
+  recordSizeCapKb: number;
+
+  // Stability hardening — artifacts & response shaping (FR-006..011a)
+  artifactDir?: string;
+  maxResponseSizeMb: number;
+  inlinePayloadMaxMb: number;
+
+  // Stability hardening — instance self-healing (FR-012..018)
+  reconnectMaxAttempts: number;
+  reconnectBackoffMs: number;
+  circuitBreakAfter: number;
+
+  // Stability hardening — heap & crash protection (FR-019..023)
+  heapSize: number;
+  memWarnPct: number;
+  memDangerPct: number;
+  memSampleIntervalSec: number;
+
+  // Stability hardening — observability (FR-024b)
+  /**
+   * Periodic stderr observability log interval in seconds. 0 (default)
+   * disables the periodic emission; the on-demand `system_observe` tool
+   * stays available regardless.
+   */
+  systemObserveIntervalSec: number;
 }

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+import {promises as fs} from 'node:fs';
 import zlib from 'node:zlib';
 
 import {logger} from '../logger.js';
@@ -14,6 +15,12 @@ import {
   parseRawTraceBuffer,
   traceResultIsSuccess,
 } from '../trace-processing/parse.js';
+import {getArtifactDirManager} from '../utils/artifactDir.js';
+import {
+  StructuredError,
+  StructuredErrorCode,
+} from '../utils/structuredError.js';
+import {summarizeRawBuffer, summarizeTrace} from '../utils/traceSummary.js';
 
 import {ToolCategory} from './categories.js';
 import type {Context, Response} from './ToolDefinition.js';
@@ -23,7 +30,7 @@ const filePathSchema = zod
   .string()
   .optional()
   .describe(
-    'The absolute file path, or a file path relative to the current working directory, to save the raw trace data. For example, trace.json.gz (compressed) or trace.json (uncompressed).',
+    'Optional. Absolute (or cwd-relative) path to write the raw trace data to. When omitted the trace is auto-allocated under the artifact directory (FR-008). Use a `.gz` suffix to gzip-compress the output.',
   );
 
 export const startTrace = definePageTool({
@@ -189,30 +196,83 @@ async function stopTracingAndAppendOutput(
 ): Promise<void> {
   try {
     const traceEventsBuffer = await page.tracing.stop();
-    if (filePath && traceEventsBuffer) {
-      let dataToWrite: Uint8Array = traceEventsBuffer;
-      if (filePath.endsWith('.gz')) {
-        dataToWrite = await new Promise((resolve, reject) => {
-          zlib.gzip(traceEventsBuffer, (error, result) => {
-            if (error) {
-              reject(error);
-            } else {
-              resolve(result);
-            }
-          });
+
+    // FR-008 — choose the on-disk target. Caller-supplied paths win; otherwise
+    // allocate under the central artifact dir so the response can stay tiny.
+    const wantsGzip = filePath ? filePath.endsWith('.gz') : false;
+    const ext = wantsGzip ? '.json.gz' : '.json';
+
+    let writtenPath: string | undefined;
+    let dataToWrite: Uint8Array | undefined;
+
+    if (traceEventsBuffer) {
+      let targetPath: string;
+      let usedClientPath = false;
+      if (filePath) {
+        targetPath = filePath;
+        usedClientPath = true;
+      } else {
+        targetPath = getArtifactDirManager().allocate(
+          'traces',
+          'page',
+          ext,
+        ).filePath;
+      }
+
+      dataToWrite = wantsGzip
+        ? await new Promise<Uint8Array>((resolve, reject) => {
+            zlib.gzip(traceEventsBuffer, (error, result) => {
+              if (error) {
+                reject(error);
+              } else {
+                resolve(result);
+              }
+            });
+          })
+        : traceEventsBuffer;
+
+      writtenPath = targetPath;
+      try {
+        if (usedClientPath) {
+          const file = await context.saveFile(dataToWrite, targetPath, ext);
+          writtenPath = file.filename;
+        } else {
+          await fs.writeFile(targetPath, dataToWrite);
+        }
+      } catch (err) {
+        throw new StructuredError({
+          code: StructuredErrorCode.DISK_WRITE_FAILED,
+          message: `Failed to persist trace to ${targetPath}.`,
+          recoverable: true,
+          nextAction:
+            'Verify the artifact directory is writable, or pass an explicit `filePath`. See `--artifact-dir`.',
+          detail: {targetPath},
+          cause: err instanceof Error ? err : undefined,
         });
       }
-      const file = await context.saveFile(
-        dataToWrite,
-        filePath,
-        filePath.endsWith('.gz') ? '.json.gz' : '.json',
-      );
-      response.appendResponseLine(
-        `The raw trace data was saved to ${file.filename}.`,
-      );
+
+      if (usedClientPath) {
+        response.appendResponseLine(
+          `The raw trace data was saved to ${writtenPath}.`,
+        );
+      }
     }
+
     const result = await parseRawTraceBuffer(traceEventsBuffer);
     response.appendResponseLine('The performance trace has been stopped.');
+
+    if (traceEventsBuffer && writtenPath && dataToWrite) {
+      const summary = traceResultIsSuccess(result)
+        ? summarizeTrace(traceEventsBuffer, result)
+        : summarizeRawBuffer(traceEventsBuffer);
+
+      response.setTracePersistence({
+        filePath: writtenPath,
+        sizeBytes: dataToWrite.byteLength,
+        summary,
+      });
+    }
+
     if (traceResultIsSuccess(result)) {
       if (context.isCruxEnabled()) {
         await populateCruxData(result);

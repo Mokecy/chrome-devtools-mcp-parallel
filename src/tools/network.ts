@@ -69,6 +69,14 @@ export const listNetworkRequests = definePageTool({
       .describe(
         'Set to true to return the preserved requests over the last 3 navigations.',
       ),
+    since: zod
+      .number()
+      .int()
+      .nonnegative()
+      .optional()
+      .describe(
+        'Epoch milliseconds (`Date.now()`). When set, only requests collected at or after this instant are returned. FR-004.',
+      ),
   },
   blockedByDialog: false,
   handler: async (request, response, context) => {
@@ -83,6 +91,7 @@ export const listNetworkRequests = definePageTool({
       resourceTypes: request.params.resourceTypes,
       includePreservedRequests: request.params.includePreservedRequests,
       networkRequestIdInDevToolsUI: reqid,
+      since: request.params.since,
     });
   },
 });

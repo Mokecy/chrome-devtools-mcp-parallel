@@ -41,6 +41,7 @@ release.bat major
 ```
 
 脚本做：
+
 1. 校验工作树干净
 2. `npm version <type> --no-git-tag-version`
 3. `git commit -m "release: vX.Y.Z"`
@@ -48,6 +49,7 @@ release.bat major
 5. `git push && git push --tags`
 
 推 tag 后 `.github/workflows/publish.yml` 自动触发：
+
 - `npm ci`
 - `npm run bundle`（tsc + rollup，产 `build/src/**/*.js` + `build/src/third_party/*` 全 bundle）
 - `npm publish --provenance --access public`
@@ -70,7 +72,12 @@ GitHub Actions → Publish to npm → Run workflow（走当前 `package.json#ver
   "mcpServers": {
     "chrome-devtools-mcp": {
       "command": "npx",
-      "args": ["chrome-devtools-mcp-parallel@latest", "--headless", "--max-instances", "5"]
+      "args": [
+        "chrome-devtools-mcp-parallel@latest",
+        "--headless",
+        "--max-instances",
+        "5"
+      ]
     }
   }
 }

@@ -18,6 +18,7 @@ import type {CallToolResult} from '../../third_party/index.js';
 import {applyAuthToContext} from '../AuthCloner.js';
 import type {AuthStateHolder} from '../AuthState.js';
 import {createBrowserLike} from '../BrowserLike.js';
+import type {ConnectionWatchdog} from '../ConnectionWatchdog.js';
 import {attachBadgeToInstance} from '../InstanceBadge.js';
 import type {InstanceRegistry} from '../InstanceRegistry.js';
 import {PerInstance} from '../PerInstance.js';
@@ -46,6 +47,13 @@ export interface InstanceCreateDeps {
   serverArgs: ParallelServerArgs;
   connectedBrowser: ConnectedBrowser | null;
   authStateHolder?: AuthStateHolder;
+  /**
+   * Optional. When provided, instanceCreate wires
+   * `browser.on('disconnected', ...)` to `watchdog.onDisconnect(instance)`
+   * so the FR-012 state machine reacts automatically to crashes /
+   * transport drops (T052).
+   */
+  watchdog?: ConnectionWatchdog;
 }
 
 export async function instanceCreate(
@@ -122,6 +130,9 @@ export async function instanceCreate(
         experimentalDevToolsDebugging: serverArgs.experimentalDevtools ?? false,
         experimentalIncludeAllPages: serverArgs.experimentalIncludeAllPages,
         performanceCrux: serverArgs.performanceCrux,
+        consoleBufferSize: serverArgs.consoleBufferSize,
+        networkBufferSize: serverArgs.networkBufferSize,
+        recordSizeCapKb: serverArgs.recordSizeCapKb,
       });
       // Trigger initial page refresh so selectedPage is populated.
       await mcpContext.createPagesSnapshot();
@@ -134,6 +145,7 @@ export async function instanceCreate(
         contextId,
         downloadPath,
         mcpContext,
+        spawnedByService: false,
       });
     } else {
       // Launch mode: start a new browser process using upstream launch().
@@ -155,7 +167,9 @@ export async function instanceCreate(
         viewport = {width: v.width, height: v.height};
       } else if (typeof rawViewport === 'string') {
         const m = /^(\d+)x(\d+)$/.exec(rawViewport);
-        if (m) viewport = {width: Number(m[1]), height: Number(m[2])};
+        if (m) {
+          viewport = {width: Number(m[1]), height: Number(m[2])};
+        }
       }
       const browser = await launch({
         headless: serverArgs.headless ?? false,
@@ -179,6 +193,9 @@ export async function instanceCreate(
         experimentalDevToolsDebugging: serverArgs.experimentalDevtools ?? false,
         experimentalIncludeAllPages: serverArgs.experimentalIncludeAllPages,
         performanceCrux: serverArgs.performanceCrux,
+        consoleBufferSize: serverArgs.consoleBufferSize,
+        networkBufferSize: serverArgs.networkBufferSize,
+        recordSizeCapKb: serverArgs.recordSizeCapKb,
       });
       // Trigger initial page refresh so selectedPage is populated.
       await mcpContext.createPagesSnapshot();
@@ -191,10 +208,31 @@ export async function instanceCreate(
         contextId: '',
         downloadPath,
         mcpContext,
+        spawnedByService: true,
+        launchConfig: {
+          headless: serverArgs.headless ?? false,
+          executablePath: serverArgs.executablePath,
+          userDataDir: serverArgs.userDataDir,
+          args: chromeArgs,
+          downloadPath,
+        },
       });
     }
 
     registry.add(instance);
+
+    // T052 — wire browser disconnect → watchdog. Both cdp and launch
+    // modes benefit: cdp surfaces transport loss, launch surfaces process
+    // exit / crash. Listener is bound to the actual browser/context
+    // reference held on the instance so recreate/refresh can rebind.
+    if (deps.watchdog && instance.browser) {
+      const watchdog = deps.watchdog;
+      const onDisconnected = (): void => {
+        void watchdog.onDisconnect(instance, 'browser disconnected');
+      };
+      instance.browser.on('disconnected', onDisconnected);
+    }
+
     lines.push(`Instance ${instanceId} created in ${mode} mode.`);
 
     if (fellBackToLaunch) {
@@ -207,7 +245,10 @@ export async function instanceCreate(
     // Permissions outside puppeteer's W3C set will throw; we report and skip.
     if (params.permissions) {
       const ctxAny = instance.context as unknown as {
-        overridePermissions?: (origin: string, perms: string[]) => Promise<void>;
+        overridePermissions?: (
+          origin: string,
+          perms: string[],
+        ) => Promise<void>;
       };
       if (typeof ctxAny.overridePermissions === 'function') {
         for (const [origin, perms] of Object.entries(params.permissions)) {
@@ -238,7 +279,7 @@ export async function instanceCreate(
       try {
         const pages = await instance.context.pages();
         const page = pages[0] ?? (await instance.context.newPage());
-        await page.goto(url, {waitUntil: 'domcontentloaded', timeout: 10000});
+        await page.goto(url, {waitUntil: 'domcontentloaded', timeout: 30000});
         lines.push(`Navigated to ${url}.`);
       } catch (navErr) {
         const reason =

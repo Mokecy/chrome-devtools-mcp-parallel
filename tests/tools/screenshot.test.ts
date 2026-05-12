@@ -23,7 +23,10 @@ describe('screenshot', () => {
         const page = context.getSelectedPptrPage();
         await page.setContent(fixture.html);
         await screenshot.handler(
-          {params: {format: 'png'}, page: context.getSelectedMcpPage()},
+          {
+            params: {format: 'png', returnBase64: true},
+            page: context.getSelectedMcpPage(),
+          },
           response,
           context,
         );
@@ -43,7 +46,7 @@ describe('screenshot', () => {
         await page.setContent(fixture.html);
         await screenshot.handler(
           {
-            params: {format: 'png', quality: 0},
+            params: {format: 'png', quality: 0, returnBase64: true},
             page: context.getSelectedMcpPage(),
           },
           response,
@@ -61,7 +64,10 @@ describe('screenshot', () => {
     it('with jpeg', async () => {
       await withMcpContext(async (response, context) => {
         await screenshot.handler(
-          {params: {format: 'jpeg'}, page: context.getSelectedMcpPage()},
+          {
+            params: {format: 'jpeg', returnBase64: true},
+            page: context.getSelectedMcpPage(),
+          },
           response,
           context,
         );
@@ -77,7 +83,10 @@ describe('screenshot', () => {
     it('with webp', async () => {
       await withMcpContext(async (response, context) => {
         await screenshot.handler(
-          {params: {format: 'webp'}, page: context.getSelectedMcpPage()},
+          {
+            params: {format: 'webp', returnBase64: true},
+            page: context.getSelectedMcpPage(),
+          },
           response,
           context,
         );
@@ -97,7 +106,7 @@ describe('screenshot', () => {
         await page.setContent(fixture.html);
         await screenshot.handler(
           {
-            params: {format: 'png', fullPage: true},
+            params: {format: 'png', fullPage: true, returnBase64: true},
             page: context.getSelectedMcpPage(),
           },
           response,
@@ -164,6 +173,7 @@ describe('screenshot', () => {
             params: {
               format: 'png',
               uid: '1_1',
+              returnBase64: true,
             },
             page: context.getSelectedMcpPage(),
           },

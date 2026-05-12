@@ -8,36 +8,25 @@ import assert from 'node:assert/strict';
 import {describe, it} from 'node:test';
 
 import {InstanceRegistry} from '../../src/parallel/InstanceRegistry.js';
+import {PerInstance} from '../../src/parallel/PerInstance.js';
 import type {Instance} from '../../src/parallel/types.js';
 
 function makeStubInstance(
   id: string,
   mode: 'cdp' | 'launch' = 'launch',
 ): Instance {
-  return {
+  // Use real PerInstance so the FR-012 state machine fires; opaque
+  // BrowserContext / McpContext are fine since the registry only touches
+  // identity + state.
+  return new PerInstance({
     id,
     mode,
     browser: null,
     context: {} as Instance['context'],
     contextId: '',
-    selectedPageIdx: 0,
     downloadPath: `/tmp/test/${id}`,
-    badgeInjected: new WeakSet(),
-    prevSnapshot: null,
-    prevSnapshotOrigin: null,
-    available: true,
     mcpContext: {} as Instance['mcpContext'],
-    createdAt: new Date(),
-    close: async () => {
-      /* stub */
-    },
-    markUnavailable() {
-      this.available = false;
-    },
-    markAvailable() {
-      this.available = true;
-    },
-  };
+  });
 }
 
 describe('InstanceRegistry', () => {

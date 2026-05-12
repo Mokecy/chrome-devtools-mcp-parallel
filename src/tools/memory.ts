@@ -5,14 +5,20 @@
  */
 
 import {zod} from '../third_party/index.js';
+import {getArtifactDirManager} from '../utils/artifactDir.js';
 import {ensureExtension} from '../utils/files.js';
+import {summarizeHeapSnapshot} from '../utils/heapSnapshotSummary.js';
+import {
+  StructuredError,
+  StructuredErrorCode,
+} from '../utils/structuredError.js';
 
 import {ToolCategory} from './categories.js';
 import {definePageTool, defineTool} from './ToolDefinition.js';
 
 export const takeMemorySnapshot = definePageTool({
   name: 'take_memory_snapshot',
-  description: `Capture a heap snapshot of the currently selected page. Use to analyze the memory distribution of JavaScript objects and debug memory leaks.`,
+  description: `Capture a heap snapshot of the currently selected page. Use to analyze the memory distribution of JavaScript objects and debug memory leaks. By default the snapshot is persisted to the artifact directory and the response carries only \`{filePath, sizeBytes, topNodeKinds}\` to keep the MCP pipe small (FR-008).`,
   annotations: {
     category: ToolCategory.MEMORY,
     readOnlyHint: false,
@@ -20,20 +26,49 @@ export const takeMemorySnapshot = definePageTool({
   schema: {
     filePath: zod
       .string()
-      .describe('A path to a .heapsnapshot file to save the heapsnapshot to.'),
+      .optional()
+      .describe(
+        'Optional absolute path (or path relative to cwd) to write the .heapsnapshot to. When omitted the file is allocated under the configured artifact directory (`--artifact-dir`) or the per-pid ephemeral root.',
+      ),
   },
   blockedByDialog: true,
   handler: async (request, response, context) => {
     const page = request.page;
-    context.validatePath(request.params.filePath);
 
-    await page.pptrPage.captureHeapSnapshot({
-      path: ensureExtension(request.params.filePath, '.heapsnapshot'),
-    });
+    let targetPath: string;
+    if (request.params.filePath) {
+      context.validatePath(request.params.filePath);
+      targetPath = ensureExtension(request.params.filePath, '.heapsnapshot');
+    } else {
+      // FR-008 — force-persist via the central ArtifactDirManager so artifacts
+      // share lifetime semantics with screenshots / traces / oversize responses.
+      const allocated = getArtifactDirManager().allocate(
+        'heapsnapshots',
+        'page',
+        '.heapsnapshot',
+      );
+      targetPath = allocated.filePath;
+    }
 
+    try {
+      await page.pptrPage.captureHeapSnapshot({path: targetPath});
+    } catch (err) {
+      throw new StructuredError({
+        code: StructuredErrorCode.DISK_WRITE_FAILED,
+        message: `Failed to capture heap snapshot to ${targetPath}.`,
+        recoverable: true,
+        nextAction:
+          'Verify the artifact directory is writable, or pass an explicit `filePath`. See `--artifact-dir`.',
+        detail: {targetPath},
+        cause: err instanceof Error ? err : undefined,
+      });
+    }
+
+    const summary = await summarizeHeapSnapshot(targetPath);
     response.appendResponseLine(
-      `Heap snapshot saved to ${request.params.filePath}`,
+      `Heap snapshot saved to ${summary.filePath} (${summary.sizeBytes} bytes).`,
     );
+    response.setHeapSnapshotPersistence(summary);
   },
 });
 

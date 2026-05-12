@@ -17,6 +17,7 @@ import {McpPage} from './McpPage.js';
 import {
   NetworkCollector,
   ConsoleCollector,
+  type CollectorDataWithMeta,
   type ListenerMap,
   type UncaughtError,
 } from './PageCollector.js';
@@ -55,6 +56,11 @@ interface McpContextOptions {
   experimentalIncludeAllPages?: boolean;
   // Whether CrUX data should be fetched.
   performanceCrux: boolean;
+  // Stability hardening (FR-001..005). All optional; collectors fall back to
+  // their built-in defaults (Console=500, Network=1000, recordCap=256 KB).
+  consoleBufferSize?: number;
+  networkBufferSize?: number;
+  recordSizeCapKb?: number;
 }
 
 const DEFAULT_TIMEOUT = 5_000;
@@ -106,21 +112,36 @@ export class McpContext implements Context {
     this.#locatorClass = locatorClass;
     this.#options = options;
 
-    this.#networkCollector = new NetworkCollector(this.browser);
+    const recordSizeCapBytes =
+      typeof options.recordSizeCapKb === 'number' && options.recordSizeCapKb > 0
+        ? options.recordSizeCapKb * 1024
+        : undefined;
 
-    this.#consoleCollector = new ConsoleCollector(this.browser, collect => {
-      return {
-        console: event => {
-          collect(event);
-        },
-        uncaughtError: event => {
-          collect(event);
-        },
-        devtoolsAggregatedIssue: event => {
-          collect(event);
-        },
-      } as ListenerMap;
+    this.#networkCollector = new NetworkCollector(this.browser, undefined, {
+      maxPerChunk: options.networkBufferSize,
+      recordSizeCapBytes,
     });
+
+    this.#consoleCollector = new ConsoleCollector(
+      this.browser,
+      collect => {
+        return {
+          console: event => {
+            collect(event);
+          },
+          uncaughtError: event => {
+            collect(event);
+          },
+          devtoolsAggregatedIssue: event => {
+            collect(event);
+          },
+        } as ListenerMap;
+      },
+      {
+        maxPerChunk: options.consoleBufferSize,
+        recordSizeCapBytes,
+      },
+    );
     this.#devtoolsUniverseManager = new UniverseManager(this.browser);
   }
 
@@ -229,6 +250,37 @@ export class McpContext implements Context {
     includePreservedMessages?: boolean,
   ): Array<ConsoleMessage | Error | DevTools.AggregatedIssue | UncaughtError> {
     return this.#consoleCollector.getData(
+      page.pptrPage,
+      includePreservedMessages,
+    );
+  }
+
+  /**
+   * Returns the network buffer aggregated metadata (size / totalPushed /
+   * evicted across all retained navigation chunks) for the given page.
+   * Used by formatters to render the FR-003 eviction footer.
+   */
+  getNetworkBufferMeta(
+    page: McpPage,
+    includePreservedRequests?: boolean,
+  ): CollectorDataWithMeta<HTTPRequest> {
+    return this.#networkCollector.getDataWithMeta(
+      page.pptrPage,
+      includePreservedRequests,
+    );
+  }
+
+  /**
+   * Returns the console buffer aggregated metadata. See
+   * {@link getNetworkBufferMeta} for semantics.
+   */
+  getConsoleBufferMeta(
+    page: McpPage,
+    includePreservedMessages?: boolean,
+  ): CollectorDataWithMeta<
+    ConsoleMessage | Error | DevTools.AggregatedIssue | UncaughtError
+  > {
+    return this.#consoleCollector.getDataWithMeta(
       page.pptrPage,
       includePreservedMessages,
     );
@@ -729,6 +781,18 @@ export class McpContext implements Context {
 
   getNetworkRequestStableId(request: HTTPRequest): number {
     return this.#networkCollector.getIdForResource(request);
+  }
+
+  /** FR-004: collection wall-clock for `since` filtering. */
+  getNetworkRequestCollectedAt(request: HTTPRequest): number | undefined {
+    return this.#networkCollector.getCollectedAt(request);
+  }
+
+  /** FR-004: collection wall-clock for `since` filtering. */
+  getConsoleMessageCollectedAt(
+    message: ConsoleMessage | Error | DevTools.AggregatedIssue | UncaughtError,
+  ): number | undefined {
+    return this.#consoleCollector.getCollectedAt(message);
   }
 
   waitForTextOnPage(

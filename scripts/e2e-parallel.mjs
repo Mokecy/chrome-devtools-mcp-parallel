@@ -1,5 +1,11 @@
 #!/usr/bin/env node
 /**
+ * @license
+ * Copyright 2026 Google LLC
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
+/**
  * E2E smoke test for parallel MCP server.
  * Launches build/src/bin/chrome-devtools-mcp-parallel.js via stdio,
  * drives JSON-RPC, validates instance_create + page_* tools work.
@@ -35,14 +41,19 @@ proc.stdout.on('data', chunk => {
   while ((idx = buf.indexOf('\n')) !== -1) {
     const line = buf.slice(0, idx).trim();
     buf = buf.slice(idx + 1);
-    if (!line) continue;
+    if (!line) {
+      continue;
+    }
     try {
       const msg = JSON.parse(line);
       if (msg.id && pending.has(msg.id)) {
         const {resolve, reject} = pending.get(msg.id);
         pending.delete(msg.id);
-        if (msg.error) reject(new Error(JSON.stringify(msg.error)));
-        else resolve(msg.result);
+        if (msg.error) {
+          reject(new Error(JSON.stringify(msg.error)));
+        } else {
+          resolve(msg.result);
+        }
       }
     } catch {
       // ignore non-JSON
@@ -160,7 +171,9 @@ async function main() {
   console.log('→ shutting down');
   proc.stdin.end();
   await sleep(500);
-  if (!proc.killed) proc.kill();
+  if (!proc.killed) {
+    proc.kill();
+  }
 }
 
 main()
@@ -171,7 +184,9 @@ main()
       process.exit(0);
     } else {
       console.log(`✗ E2E failed (${failures.length} assertion(s)):`);
-      for (const f of failures) console.log('  - ' + f);
+      for (const f of failures) {
+        console.log('  - ' + f);
+      }
       console.log('\n--- stderr ---');
       console.log(stderrBuf.slice(-4000));
       process.exit(1);
@@ -183,6 +198,8 @@ main()
     console.log(stderrBuf.slice(-4000));
     try {
       proc.kill();
-    } catch {}
+    } catch {
+      // best-effort kill; child may already be dead
+    }
     process.exit(2);
   });

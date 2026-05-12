@@ -15,6 +15,7 @@ import {z as zod} from 'zod';
 import {InstanceMutex} from '../../src/parallel/InstanceMutex.js';
 import {InstanceRegistry} from '../../src/parallel/InstanceRegistry.js';
 import {derivePageTool} from '../../src/parallel/PageToolAdapter.js';
+import {PerInstance} from '../../src/parallel/PerInstance.js';
 import type {Instance, ParallelServerArgs} from '../../src/parallel/types.js';
 import type {ToolDefinition} from '../../src/tools/ToolDefinition.js';
 
@@ -99,42 +100,30 @@ describe('PageToolAdapter', () => {
       );
     });
 
-    it('unavailable instance returns error', async () => {
+    it('dead instance returns INSTANCE_DEAD structured error (T045)', async () => {
       const deps = makeDeps();
-      // Add a stub instance that is unavailable
-      const stubInstance: Instance = {
+      const stubInstance: Instance = new PerInstance({
         id: 'down',
         mode: 'launch',
         browser: null,
         context: {} as Instance['context'],
         contextId: '',
-        selectedPageIdx: 0,
         downloadPath: '/tmp',
-        badgeInjected: new WeakSet(),
-        prevSnapshot: null,
-        prevSnapshotOrigin: null,
-        available: false,
         mcpContext: {} as Instance['mcpContext'],
-        createdAt: new Date(),
-        close: async () => {
-          /* stub */
-        },
-        markUnavailable() {
-          this.available = false;
-        },
-        markAvailable() {
-          this.available = true;
-        },
-      };
+      });
+      stubInstance.setState('dead', 'simulated');
       deps.registry.add(stubInstance);
 
       const derived = derivePageTool(makeFakeUpstream('click'), deps);
       const result = await derived.dispatch({instanceId: 'down'});
       assert.equal(result.isError, true);
-      assert.ok(
-        result.content[0].type === 'text' &&
-          result.content[0].text.includes('unavailable'),
-      );
+      assert.ok(result.content[0].type === 'text');
+      // FR-013 / FR-018 — structured payload + recovery hint.
+      const sc = Reflect.get(result, 'structuredContent');
+      assert.ok(sc, 'should carry structuredContent');
+      assert.equal(Reflect.get(sc, 'code'), 'INSTANCE_DEAD');
+      assert.equal(Reflect.get(sc, 'recoverable'), true);
+      assert.match(String(Reflect.get(sc, 'nextAction')), /instance_recreate/);
     });
   });
 });

@@ -30,9 +30,12 @@ describe('memory', () => {
             response,
             context,
           );
-          assert.equal(
-            response.responseLines.at(0),
-            `Heap snapshot saved to ${filePath}`,
+          // T035: response line now includes the on-disk byte count.
+          assert.match(
+            response.responseLines.at(0) ?? '',
+            new RegExp(
+              `^Heap snapshot saved to ${filePath.replace(/[.\\/]/g, '\\$&')} \\(\\d+ bytes\\)\\.$`,
+            ),
           );
           assert.ok(existsSync(filePath));
         } finally {

@@ -30,7 +30,137 @@ const parallelOptions = {
       'Whether to auto-launch a Chrome debug instance when no debug port detected. Use --no-auto-launch to disable.',
     default: true,
   },
+
+  // ---- Stability hardening: buffer / log management (FR-001..005) ----
+  consoleBufferSize: {
+    type: 'number',
+    description:
+      'Per-page console message buffer cap (env CDM_CONSOLE_BUFFER_SIZE, default 500).',
+  },
+  networkBufferSize: {
+    type: 'number',
+    description:
+      'Per-page network request buffer cap (env CDM_NETWORK_BUFFER_SIZE, default 1000).',
+  },
+  recordSizeCapKb: {
+    type: 'number',
+    description:
+      'Single buffered record size cap in KB; oversize records are truncated (env CDM_RECORD_SIZE_CAP_KB, default 256).',
+  },
+
+  // ---- Stability hardening: artifacts / response (FR-006..011a) ----
+  artifactDir: {
+    type: 'string',
+    description:
+      'Persistent artifact directory; if unset, an ephemeral dir under tmpdir is used and auto-cleaned on exit (env CDM_ARTIFACT_DIR).',
+  },
+  maxResponseSizeMb: {
+    type: 'number',
+    description:
+      'Per-tool response size cap in MB; larger responses are written to disk and replaced with a path (env CDM_MAX_RESPONSE_SIZE_MB, default 2).',
+  },
+  inlinePayloadMaxMb: {
+    type: 'number',
+    description:
+      'Maximum inline payload size in MB for screenshots/binary data when the caller opts into inline (env CDM_INLINE_PAYLOAD_MAX_MB, default 1).',
+  },
+
+  // ---- Stability hardening: self-heal (FR-012..018) ----
+  reconnectMaxAttempts: {
+    type: 'number',
+    description:
+      'Maximum CDP reconnect attempts per disconnect event (env CDM_RECONNECT_MAX_ATTEMPTS, default 3).',
+  },
+  reconnectBackoffMs: {
+    type: 'number',
+    description:
+      'Initial reconnect backoff in ms; doubles each attempt (env CDM_RECONNECT_BACKOFF_MS, default 1000).',
+  },
+  circuitBreakAfter: {
+    type: 'number',
+    description:
+      'Number of consecutive failed reconnect cycles before declaring an instance permanently dead (env CDM_CIRCUIT_BREAK_AFTER, default 3).',
+  },
+
+  // ---- Stability hardening: heap / memory (FR-019..023) ----
+  heapSize: {
+    type: 'number',
+    description:
+      'Desired V8 old-space heap cap in MB; bin entry will respawn under --max-old-space-size if current limit is below this (env CDM_HEAP_SIZE_MB, default 4096).',
+  },
+  memWarnPct: {
+    type: 'number',
+    description:
+      'Heap utilization percentage that triggers a warning log (env CDM_MEM_WARN_PCT, default 80).',
+  },
+  memDangerPct: {
+    type: 'number',
+    description:
+      'Heap utilization percentage that triggers active resource release (env CDM_MEM_DANGER_PCT, default 95).',
+  },
+  memSampleIntervalSec: {
+    type: 'number',
+    description:
+      'Memory sampling interval in seconds (env CDM_MEM_SAMPLE_INTERVAL_SEC, default 60).',
+  },
+  systemObserveIntervalSec: {
+    type: 'number',
+    description:
+      'Periodic stderr observability log interval in seconds. 0 disables (env CDM_SYSTEM_OBSERVE_INTERVAL_SEC, default 0).',
+  },
 } satisfies Record<string, YargsOptions>;
+
+/**
+ * Resolve a numeric option with the precedence:
+ *   CLI flag > environment variable > built-in default.
+ * Returns the default when neither CLI nor env supplies a finite number.
+ */
+function resolveNumberOption(
+  cliValue: number | undefined,
+  envValue: string | undefined,
+  defaultValue: number,
+): number {
+  if (typeof cliValue === 'number' && Number.isFinite(cliValue)) {
+    return cliValue;
+  }
+  if (envValue !== undefined && envValue !== '') {
+    const parsed = Number(envValue);
+    if (Number.isFinite(parsed)) {
+      return parsed;
+    }
+  }
+  return defaultValue;
+}
+
+function resolveStringOption(
+  cliValue: string | undefined,
+  envValue: string | undefined,
+): string | undefined {
+  if (typeof cliValue === 'string' && cliValue.length > 0) {
+    return cliValue;
+  }
+  if (envValue !== undefined && envValue !== '') {
+    return envValue;
+  }
+  return undefined;
+}
+
+/** Defaults for stability hardening options (FR mapping in tasks.md §5). */
+export const STABILITY_DEFAULTS = {
+  consoleBufferSize: 500,
+  networkBufferSize: 1000,
+  recordSizeCapKb: 256,
+  maxResponseSizeMb: 2,
+  inlinePayloadMaxMb: 1,
+  reconnectMaxAttempts: 3,
+  reconnectBackoffMs: 1000,
+  circuitBreakAfter: 3,
+  heapSize: 4096,
+  memWarnPct: 80,
+  memDangerPct: 95,
+  memSampleIntervalSec: 60,
+  systemObserveIntervalSec: 0,
+} as const;
 
 /**
  * Parse CLI arguments for parallel mode.
@@ -60,7 +190,12 @@ export function parseParallelArguments(
       }
     };
     if (a === '--chrome-arg' || a.startsWith('--chrome-arg=')) {
-      captureInto(rawChromeArgs, a.startsWith('--chrome-arg=') ? a.slice('--chrome-arg='.length) : undefined);
+      captureInto(
+        rawChromeArgs,
+        a.startsWith('--chrome-arg=')
+          ? a.slice('--chrome-arg='.length)
+          : undefined,
+      );
       continue;
     }
     if (
@@ -123,6 +258,75 @@ export function parseParallelArguments(
     ...parsed,
     maxInstances: (parsed.maxInstances ?? 10) satisfies number,
     autoLaunch: (parsed.autoLaunch ?? true) satisfies boolean,
+    consoleBufferSize: resolveNumberOption(
+      parsed.consoleBufferSize,
+      env['CDM_CONSOLE_BUFFER_SIZE'],
+      STABILITY_DEFAULTS.consoleBufferSize,
+    ),
+    networkBufferSize: resolveNumberOption(
+      parsed.networkBufferSize,
+      env['CDM_NETWORK_BUFFER_SIZE'],
+      STABILITY_DEFAULTS.networkBufferSize,
+    ),
+    recordSizeCapKb: resolveNumberOption(
+      parsed.recordSizeCapKb,
+      env['CDM_RECORD_SIZE_CAP_KB'],
+      STABILITY_DEFAULTS.recordSizeCapKb,
+    ),
+    artifactDir: resolveStringOption(
+      parsed.artifactDir,
+      env['CDM_ARTIFACT_DIR'],
+    ),
+    maxResponseSizeMb: resolveNumberOption(
+      parsed.maxResponseSizeMb,
+      env['CDM_MAX_RESPONSE_SIZE_MB'],
+      STABILITY_DEFAULTS.maxResponseSizeMb,
+    ),
+    inlinePayloadMaxMb: resolveNumberOption(
+      parsed.inlinePayloadMaxMb,
+      env['CDM_INLINE_PAYLOAD_MAX_MB'],
+      STABILITY_DEFAULTS.inlinePayloadMaxMb,
+    ),
+    reconnectMaxAttempts: resolveNumberOption(
+      parsed.reconnectMaxAttempts,
+      env['CDM_RECONNECT_MAX_ATTEMPTS'],
+      STABILITY_DEFAULTS.reconnectMaxAttempts,
+    ),
+    reconnectBackoffMs: resolveNumberOption(
+      parsed.reconnectBackoffMs,
+      env['CDM_RECONNECT_BACKOFF_MS'],
+      STABILITY_DEFAULTS.reconnectBackoffMs,
+    ),
+    circuitBreakAfter: resolveNumberOption(
+      parsed.circuitBreakAfter,
+      env['CDM_CIRCUIT_BREAK_AFTER'],
+      STABILITY_DEFAULTS.circuitBreakAfter,
+    ),
+    heapSize: resolveNumberOption(
+      parsed.heapSize,
+      env['CDM_HEAP_SIZE_MB'],
+      STABILITY_DEFAULTS.heapSize,
+    ),
+    memWarnPct: resolveNumberOption(
+      parsed.memWarnPct,
+      env['CDM_MEM_WARN_PCT'],
+      STABILITY_DEFAULTS.memWarnPct,
+    ),
+    memDangerPct: resolveNumberOption(
+      parsed.memDangerPct,
+      env['CDM_MEM_DANGER_PCT'],
+      STABILITY_DEFAULTS.memDangerPct,
+    ),
+    memSampleIntervalSec: resolveNumberOption(
+      parsed.memSampleIntervalSec,
+      env['CDM_MEM_SAMPLE_INTERVAL_SEC'],
+      STABILITY_DEFAULTS.memSampleIntervalSec,
+    ),
+    systemObserveIntervalSec: resolveNumberOption(
+      parsed.systemObserveIntervalSec,
+      env['CDM_SYSTEM_OBSERVE_INTERVAL_SEC'],
+      STABILITY_DEFAULTS.systemObserveIntervalSec,
+    ),
   } satisfies ParallelServerArgs;
   if (rawChromeArgs.length > 0) {
     finalArgs.chromeArg = rawChromeArgs;

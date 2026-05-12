@@ -39,6 +39,7 @@ import type {
 import type {InsightName, TraceResult} from './trace-processing/parse.js';
 import {getInsightOutput, getTraceSummary} from './trace-processing/parse.js';
 import {paginate} from './utils/pagination.js';
+import {isStructuredError} from './utils/structuredError.js';
 import type {PaginationOptions} from './utils/types.js';
 
 interface TraceInsightData {
@@ -155,6 +156,18 @@ async function getToolGroup(
   return toolGroup;
 }
 
+/**
+ * FR-004: maps a high-level severity word (`level` filter) to the concrete
+ * `ConsoleMessageType` strings reported by Puppeteer / DevTools.
+ */
+const LEVEL_EXPANSION: Record<string, readonly string[]> = {
+  error: ['error', 'assert'],
+  warn: ['warn', 'warning'],
+  info: ['info', 'log', 'dir', 'dirxml', 'table', 'trace', 'count', 'timeEnd'],
+  debug: ['debug', 'verbose'],
+  log: ['log'],
+};
+
 export class McpResponse implements Response {
   #includePages = false;
   #includeExtensionServiceWorkers = false;
@@ -182,18 +195,35 @@ export class McpResponse implements Response {
     staticData?: DevTools.HeapSnapshotModel.HeapSnapshotModel.StaticData | null;
     nodes?: DevTools.HeapSnapshotModel.HeapSnapshotModel.ItemsRange;
   };
+  #heapSnapshotPersistence?: {
+    filePath: string;
+    sizeBytes: number;
+    topNodeKinds: Array<{kind: string; count: number}>;
+  };
+  #tracePersistence?: {
+    filePath: string;
+    sizeBytes: number;
+    summary: {
+      events: number;
+      samplingWindowMs: number;
+      coreMetrics: {lcpMs?: number; clsScore?: number; inpMs?: number};
+    };
+  };
   #networkRequestsOptions?: {
     include: boolean;
     pagination?: PaginationOptions;
     resourceTypes?: ResourceType[];
     includePreservedRequests?: boolean;
     networkRequestIdInDevToolsUI?: number;
+    since?: number;
   };
   #consoleDataOptions?: {
     include: boolean;
     pagination?: PaginationOptions;
     types?: string[];
     includePreservedMessages?: boolean;
+    since?: number;
+    level?: string[];
   };
   #listExtensions?: boolean;
   #listThirdPartyDeveloperTools?: boolean;
@@ -260,6 +290,7 @@ export class McpResponse implements Response {
       resourceTypes?: ResourceType[];
       includePreservedRequests?: boolean;
       networkRequestIdInDevToolsUI?: number;
+      since?: number;
     },
   ): void {
     if (!value) {
@@ -279,6 +310,7 @@ export class McpResponse implements Response {
       resourceTypes: options?.resourceTypes,
       includePreservedRequests: options?.includePreservedRequests,
       networkRequestIdInDevToolsUI: options?.networkRequestIdInDevToolsUI,
+      since: options?.since,
     };
   }
 
@@ -287,6 +319,8 @@ export class McpResponse implements Response {
     options?: PaginationOptions & {
       types?: string[];
       includePreservedMessages?: boolean;
+      since?: number;
+      level?: string[];
     },
   ): void {
     if (!value) {
@@ -305,6 +339,8 @@ export class McpResponse implements Response {
           : undefined,
       types: options?.types,
       includePreservedMessages: options?.includePreservedMessages,
+      since: options?.since,
+      level: options?.level,
     };
   }
 
@@ -424,6 +460,46 @@ export class McpResponse implements Response {
       include: true,
       nodes,
       pagination: options,
+    };
+  }
+
+  /**
+   * FR-008 — record disk-persistence metadata for a freshly captured
+   * performance trace. Mirrors `setHeapSnapshotPersistence`. The legacy
+   * `traceSummary` slot keeps holding the formatted text summary; this
+   * new slot carries the on-disk pointer + numeric envelope.
+   */
+  setTracePersistence(data: {
+    filePath: string;
+    sizeBytes: number;
+    summary: {
+      events: number;
+      samplingWindowMs: number;
+      coreMetrics: {lcpMs?: number; clsScore?: number; inpMs?: number};
+    };
+  }): void {
+    this.#tracePersistence = {
+      filePath: data.filePath,
+      sizeBytes: data.sizeBytes,
+      summary: data.summary,
+    };
+  }
+
+  /**
+   * FR-008 — record disk-persistence metadata for a freshly captured
+   * heap snapshot. The legacy inline `heapSnapshot` payload stays empty with a
+   * `movedTo` pointer so older clients that read the field still see a
+   * shape they can dispatch on.
+   */
+  setHeapSnapshotPersistence(data: {
+    filePath: string;
+    sizeBytes: number;
+    topNodeKinds: Array<{kind: string; count: number}>;
+  }): void {
+    this.#heapSnapshotPersistence = {
+      filePath: data.filePath,
+      sizeBytes: data.sizeBytes,
+      topNodeKinds: data.topNodeKinds,
     };
   }
 
@@ -576,8 +652,24 @@ export class McpResponse implements Response {
         this.#consoleDataOptions.includePreservedMessages,
       );
 
-      if (this.#consoleDataOptions.types?.length) {
-        const normalizedTypes = new Set(this.#consoleDataOptions.types);
+      const normalizedTypes = new Set<string>(
+        this.#consoleDataOptions.types ?? [],
+      );
+      // FR-004: `level` is a high-level severity alias that expands into
+      // concrete ConsoleMessage types and is unioned with `types`.
+      if (this.#consoleDataOptions.level?.length) {
+        for (const lvl of this.#consoleDataOptions.level) {
+          const expanded = LEVEL_EXPANSION[lvl];
+          if (expanded) {
+            for (const t of expanded) {
+              normalizedTypes.add(t);
+            }
+          } else {
+            normalizedTypes.add(lvl);
+          }
+        }
+      }
+      if (normalizedTypes.size > 0) {
         messages = messages.filter(message => {
           if ('type' in message) {
             return normalizedTypes.has(message.type());
@@ -586,6 +678,14 @@ export class McpResponse implements Response {
             return normalizedTypes.has('issue');
           }
           return normalizedTypes.has('error');
+        });
+      }
+      // FR-004: `since` filters by collection wall-clock (epoch ms).
+      const consoleSince = this.#consoleDataOptions.since;
+      if (typeof consoleSince === 'number') {
+        messages = messages.filter(message => {
+          const ts = context.getConsoleMessageCollectedAt(message);
+          return typeof ts === 'number' ? ts >= consoleSince : true;
         });
       }
 
@@ -640,6 +740,14 @@ export class McpResponse implements Response {
           return normalizedTypes.has(type);
         });
       }
+      // FR-004: `since` filters by collection wall-clock (epoch ms).
+      const networkSince = this.#networkRequestsOptions.since;
+      if (typeof networkSince === 'number') {
+        requests = requests.filter(request => {
+          const ts = context.getNetworkRequestCollectedAt(request);
+          return typeof ts === 'number' ? ts >= networkSince : true;
+        });
+      }
 
       if (requests.length) {
         networkRequests = await Promise.all(
@@ -672,6 +780,7 @@ export class McpResponse implements Response {
       thirdPartyDeveloperTools,
       webmcpTools,
       errorMessage: this.#error?.message,
+      error: this.#error,
     });
   }
 
@@ -691,6 +800,7 @@ export class McpResponse implements Response {
       thirdPartyDeveloperTools?: ToolGroup<ToolDefinition>;
       webmcpTools?: WebMCPTool[];
       errorMessage?: string;
+      error?: Error;
     },
   ): {content: Array<TextContent | ImageContent>; structuredContent: object} {
     const structuredContent: {
@@ -699,8 +809,18 @@ export class McpResponse implements Response {
       tabId?: string;
       networkRequest?: object;
       networkRequests?: object[];
+      networkBufferMeta?: {
+        retained: number;
+        totalPushed: number;
+        evicted: number;
+      };
       consoleMessage?: object;
       consoleMessages?: object[];
+      consoleBufferMeta?: {
+        retained: number;
+        totalPushed: number;
+        evicted: number;
+      };
       traceSummary?: string;
       traceInsights?: Array<{insightName: string; insightKey: string}>;
       lighthouseResult?: object;
@@ -724,9 +844,26 @@ export class McpResponse implements Response {
       heapSnapshot?: {
         stats?: object;
         staticData?: object;
+        movedTo?: string;
       };
       heapSnapshotData?: object[];
       heapSnapshotNodes?: readonly object[];
+      heapSnapshotPersistence?: {
+        filePath: string;
+        sizeBytes: number;
+        topNodeKinds: Array<{kind: string; count: number}>;
+        movedTo: string;
+      };
+      tracePersistence?: {
+        filePath: string;
+        sizeBytes: number;
+        summary: {
+          events: number;
+          samplingWindowMs: number;
+          coreMetrics: {lcpMs?: number; clsScore?: number; inpMs?: number};
+        };
+        movedTo: string;
+      };
       extensionServiceWorkers?: object[];
       extensionPages?: object[];
       errorMessage?: string;
@@ -976,6 +1113,58 @@ Call ${handleDialog.name} to handle it before continuing.`);
       }
     }
 
+    if (this.#heapSnapshotPersistence) {
+      const p = this.#heapSnapshotPersistence;
+      response.push('## Heap Snapshot');
+      response.push(`Heap snapshot persisted to ${p.filePath}`);
+      response.push(`Size: ${p.sizeBytes} bytes`);
+      if (p.topNodeKinds.length) {
+        response.push(
+          `Top node kinds: ${p.topNodeKinds
+            .map(b => `${b.kind}=${b.count}`)
+            .join(', ')}`,
+        );
+      }
+      structuredContent.heapSnapshotPersistence = {
+        filePath: p.filePath,
+        sizeBytes: p.sizeBytes,
+        topNodeKinds: p.topNodeKinds,
+        movedTo: p.filePath,
+      };
+      // FR-008 — keep legacy field present but empty so old clients don't NPE.
+      structuredContent.heapSnapshot = structuredContent.heapSnapshot || {};
+      structuredContent.heapSnapshot.movedTo = p.filePath;
+    }
+
+    if (this.#tracePersistence) {
+      const t = this.#tracePersistence;
+      const cm = t.summary.coreMetrics;
+      response.push('## Performance Trace');
+      response.push(`Trace persisted to ${t.filePath}`);
+      response.push(
+        `Size: ${t.sizeBytes} bytes; events: ${t.summary.events}; samplingWindowMs: ${t.summary.samplingWindowMs}`,
+      );
+      const cmParts: string[] = [];
+      if (typeof cm.lcpMs === 'number') {
+        cmParts.push(`LCP=${cm.lcpMs}ms`);
+      }
+      if (typeof cm.inpMs === 'number') {
+        cmParts.push(`INP=${cm.inpMs}ms`);
+      }
+      if (typeof cm.clsScore === 'number') {
+        cmParts.push(`CLS=${cm.clsScore}`);
+      }
+      if (cmParts.length) {
+        response.push(`Core metrics: ${cmParts.join(', ')}`);
+      }
+      structuredContent.tracePersistence = {
+        filePath: t.filePath,
+        sizeBytes: t.sizeBytes,
+        summary: t.summary,
+        movedTo: t.filePath,
+      };
+    }
+
     if (data.detailedNetworkRequest) {
       response.push(data.detailedNetworkRequest.toStringDetailed());
       structuredContent.networkRequest =
@@ -1056,6 +1245,22 @@ Call ${handleDialog.name} to handle it before continuing.`);
       const requests = data.networkRequests;
 
       response.push('## Network requests');
+      // FR-003: surface buffer eviction so callers know history was dropped.
+      if (this.#page) {
+        const meta = context.getNetworkBufferMeta(
+          this.#page,
+          this.#networkRequestsOptions?.includePreservedRequests,
+        );
+        if (meta.total.evicted > 0) {
+          const footer = `Buffer status: showing ${meta.total.size} retained of ${meta.total.totalPushed} observed; ${meta.total.evicted} earlier records evicted.`;
+          response.push(footer);
+          structuredContent.networkBufferMeta = {
+            retained: meta.total.size,
+            totalPushed: meta.total.totalPushed,
+            evicted: meta.total.evicted,
+          };
+        }
+      }
       if (requests.length) {
         const paginationData = this.#dataWithPagination(
           requests,
@@ -1079,6 +1284,19 @@ Call ${handleDialog.name} to handle it before continuing.`);
       const messages = data.consoleMessages ?? [];
 
       response.push('## Console messages');
+      // FR-003: surface buffer eviction footer.
+      if (this.#page) {
+        const meta = context.getConsoleBufferMeta(this.#page, false);
+        if (meta.total.evicted > 0) {
+          const footer = `Buffer status: showing ${meta.total.size} retained of ${meta.total.totalPushed} observed; ${meta.total.evicted} earlier records evicted.`;
+          response.push(footer);
+          structuredContent.consoleBufferMeta = {
+            retained: meta.total.size,
+            totalPushed: meta.total.totalPushed,
+            evicted: meta.total.evicted,
+          };
+        }
+      }
       if (messages.length) {
         const grouped = ConsoleFormatter.groupConsecutive(messages);
         const paginationData = this.#dataWithPagination(
@@ -1096,7 +1314,16 @@ Call ${handleDialog.name} to handle it before continuing.`);
       }
     }
 
-    if (data.errorMessage) {
+    if (data.error && isStructuredError(data.error)) {
+      // FR-026: surface structured error envelope to clients that opt into
+      // `structuredContent`; keep the legacy `errorMessage` field populated
+      // so existing parsers don't break.
+      const err = data.error;
+      const formatted = `[${err.code}] ${err.message} (next: ${err.nextAction})`;
+      response.push(`Error: ${formatted}`);
+      structuredContent.errorMessage = formatted;
+      Object.assign(structuredContent, {error: err.toJSON()});
+    } else if (data.errorMessage) {
       response.push(`Error: ${data.errorMessage}`);
       structuredContent.errorMessage = data.errorMessage;
     }

@@ -22,11 +22,23 @@ import {
   type Page,
   type PageEvents as PuppeteerPageEvents,
 } from './third_party/index.js';
+import {ChunkBuffer, type ChunkMeta} from './utils/chunkBuffer.js';
 import {
+  collectedAtSymbol,
   createIdGenerator,
+  oversizeSymbol,
   stableIdSymbol,
   type WithSymbolId,
 } from './utils/id.js';
+
+export interface CollectorDataWithMeta<T> {
+  /** Items in oldest-to-newest order from the active (most recent) chunk. */
+  items: T[];
+  /** Per-chunk metadata, newest chunk first. */
+  chunks: ChunkMeta[];
+  /** Sum across all chunks. */
+  total: ChunkMeta;
+}
 
 export class UncaughtError {
   readonly details: Protocol.Runtime.ExceptionDetails;
@@ -47,6 +59,11 @@ export type ListenerMap<EventMap extends PageEvents = PageEvents> = {
   [K in keyof EventMap]?: (event: EventMap[K]) => void;
 };
 
+/** Default cap when caller does not specify one. Large enough to keep tests
+ *  that do not care about buffering green; concrete subclasses (Console /
+ *  Network) override this with the spec-mandated defaults (FR-002). */
+const DEFAULT_MAX_PER_CHUNK = 10_000;
+
 export class PageCollector<T> {
   #browser: Browser;
   #listenersInitializer: (
@@ -54,20 +71,30 @@ export class PageCollector<T> {
   ) => ListenerMap<PageEvents>;
   #listeners = new WeakMap<Page, ListenerMap>();
   protected maxNavigationSaved = 3;
+  protected readonly maxPerChunk: number;
+  /** FR-005: per-record byte budget; `0` disables the check. */
+  protected readonly recordSizeCapBytes: number;
+  /** Best-effort byte estimator for incoming records; subclasses override. */
+  protected estimateRecordBytes(_item: T): number {
+    return 0;
+  }
 
   /**
-   * This maps a Page to a list of navigations with a sub-list
-   * of all collected resources.
-   * The newer navigations come first.
+   * Maps a Page to its navigation history, newest navigation first. Each
+   * navigation is a {@link ChunkBuffer} bounded by {@link maxPerChunk}; older
+   * records are evicted FIFO once the cap is hit (FR-001..002).
    */
-  protected storage = new WeakMap<Page, Array<Array<WithSymbolId<T>>>>();
+  protected storage = new WeakMap<Page, Array<ChunkBuffer<WithSymbolId<T>>>>();
 
   constructor(
     browser: Browser,
     listeners: (collector: (item: T) => void) => ListenerMap<PageEvents>,
+    options: {maxPerChunk?: number; recordSizeCapBytes?: number} = {},
   ) {
     this.#browser = browser;
     this.#listenersInitializer = listeners;
+    this.maxPerChunk = options.maxPerChunk ?? DEFAULT_MAX_PER_CHUNK;
+    this.recordSizeCapBytes = options.recordSizeCapBytes ?? 0;
   }
 
   async init(pages: Page[]) {
@@ -117,14 +144,39 @@ export class PageCollector<T> {
       return;
     }
     const idGenerator = createIdGenerator();
-    const storedLists: Array<Array<WithSymbolId<T>>> = [[]];
+    const storedLists: Array<ChunkBuffer<WithSymbolId<T>>> = [
+      new ChunkBuffer<WithSymbolId<T>>(this.maxPerChunk),
+    ];
     this.storage.set(page, storedLists);
 
     const listeners = this.#listenersInitializer(value => {
       const withId = value as WithSymbolId<T>;
       withId[stableIdSymbol] = idGenerator();
+      // FR-004: stamp wall-clock so `since` filtering can run at query time.
+      if (withId[collectedAtSymbol] === undefined) {
+        try {
+          withId[collectedAtSymbol] = Date.now();
+        } catch {
+          // value is a primitive (e.g. test fixture using numbers) — ignore.
+        }
+      }
+      // FR-005: estimate record size and stamp oversize marker without
+      // mutating the underlying Puppeteer object.
+      if (this.recordSizeCapBytes > 0) {
+        try {
+          const bytes = this.estimateRecordBytes(value);
+          if (bytes > this.recordSizeCapBytes) {
+            withId[oversizeSymbol] = true;
+          }
+        } catch {
+          // estimator must not throw; ignore measurement failure.
+        }
+      }
 
-      const navigations = this.storage.get(page) ?? [[]];
+      const navigations = this.storage.get(page);
+      if (!navigations || navigations.length === 0) {
+        return;
+      }
       navigations[0].push(withId);
     });
 
@@ -149,7 +201,7 @@ export class PageCollector<T> {
       return;
     }
     // Add the latest navigation first
-    navigations.unshift([]);
+    navigations.unshift(new ChunkBuffer<WithSymbolId<T>>(this.maxPerChunk));
     navigations.splice(this.maxNavigationSaved);
   }
 
@@ -170,20 +222,72 @@ export class PageCollector<T> {
     }
 
     if (!includePreservedData) {
-      return navigations[0];
+      return navigations[0].toArray();
     }
 
     const data: T[] = [];
     for (let index = this.maxNavigationSaved; index >= 0; index--) {
-      if (navigations[index]) {
-        data.push(...navigations[index]);
+      const chunk = navigations[index];
+      if (chunk) {
+        data.push(...chunk.toArray());
       }
     }
     return data;
   }
 
+  /**
+   * Same as {@link getData} but returns per-chunk and aggregated metadata so
+   * the caller can surface eviction / total-seen counters in the tool
+   * response (FR-003).
+   */
+  getDataWithMeta(
+    page: Page,
+    includePreservedData?: boolean,
+  ): CollectorDataWithMeta<T> {
+    const navigations = this.storage.get(page);
+    if (!navigations || navigations.length === 0) {
+      return {
+        items: [],
+        chunks: [],
+        total: {size: 0, totalPushed: 0, evicted: 0},
+      };
+    }
+
+    const chunks: ChunkMeta[] = [];
+    for (const chunk of navigations) {
+      chunks.push(chunk.meta());
+    }
+
+    const total: ChunkMeta = {size: 0, totalPushed: 0, evicted: 0};
+    for (const meta of chunks) {
+      total.size += meta.size;
+      total.totalPushed += meta.totalPushed;
+      total.evicted += meta.evicted;
+    }
+
+    const items = includePreservedData
+      ? this.getData(page, true)
+      : navigations[0].toArray();
+
+    return {items, chunks, total};
+  }
+
   getIdForResource(resource: WithSymbolId<T>): number {
     return resource[stableIdSymbol] ?? -1;
+  }
+
+  /**
+   * Returns the wall-clock epoch ms at which `resource` was inserted into the
+   * collector, or `undefined` when the value cannot carry a symbol property
+   * (e.g. primitive test fixtures). FR-004.
+   */
+  getCollectedAt(resource: WithSymbolId<T>): number | undefined {
+    return resource[collectedAtSymbol];
+  }
+
+  /** FR-005: returns true if the record exceeded the configured cap at push time. */
+  isOversize(resource: WithSymbolId<T>): boolean {
+    return resource[oversizeSymbol] === true;
   }
 
   getById(page: Page, stableId: number): T {
@@ -211,7 +315,7 @@ export class PageCollector<T> {
     }
 
     for (const navigation of navigations) {
-      const item = navigation.find(filter);
+      const item = navigation.toArray().find(filter);
       if (item) {
         return item;
       }
@@ -220,10 +324,59 @@ export class PageCollector<T> {
   }
 }
 
+/** FR-002: console buffer default 500 records per navigation chunk. */
+export const DEFAULT_CONSOLE_BUFFER_SIZE = 500;
+
 export class ConsoleCollector extends PageCollector<
   ConsoleMessage | Error | DevTools.AggregatedIssue | UncaughtError
 > {
   #subscribedPages = new WeakMap<Page, PageEventSubscriber>();
+
+  constructor(
+    browser: Browser,
+    listeners: (
+      collector: (
+        item: ConsoleMessage | Error | DevTools.AggregatedIssue | UncaughtError,
+      ) => void,
+    ) => ListenerMap<PageEvents>,
+    options: {maxPerChunk?: number; recordSizeCapBytes?: number} = {},
+  ) {
+    super(browser, listeners, {
+      maxPerChunk: options.maxPerChunk ?? DEFAULT_CONSOLE_BUFFER_SIZE,
+      recordSizeCapBytes: options.recordSizeCapBytes,
+    });
+  }
+
+  /**
+   * FR-005: cheap byte estimate for the textual payload that ConsoleFormatter
+   * would later surface. We deliberately keep this O(1) per record by skipping
+   * arg materialization (which is async / expensive) and only inspecting the
+   * synchronous text/details fields.
+   */
+  protected override estimateRecordBytes(
+    item: ConsoleMessage | Error | DevTools.AggregatedIssue | UncaughtError,
+  ): number {
+    if (item instanceof UncaughtError) {
+      return (
+        (item.details.text?.length ?? 0) +
+        (item.details.exception?.description?.length ?? 0)
+      );
+    }
+    if (item instanceof Error) {
+      return (item.message?.length ?? 0) + (item.stack?.length ?? 0);
+    }
+    if (item instanceof DevTools.AggregatedIssue) {
+      // AggregatedIssue is internal — fall back to a constant lower bound.
+      return 0;
+    }
+    // ConsoleMessage: .text() is sync, args() returns handles (skip).
+    try {
+      const text = item.text();
+      return typeof text === 'string' ? text.length : 0;
+    } catch {
+      return 0;
+    }
+  }
 
   override addPage(page: Page): void {
     super.addPage(page);
@@ -358,6 +511,9 @@ class PageEventSubscriber {
   };
 }
 
+/** FR-002: network buffer default 1000 records per navigation chunk. */
+export const DEFAULT_NETWORK_BUFFER_SIZE = 1000;
+
 export class NetworkCollector extends PageCollector<HTTPRequest> {
   constructor(
     browser: Browser,
@@ -370,16 +526,41 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
         },
       } as ListenerMap;
     },
+    options: {maxPerChunk?: number; recordSizeCapBytes?: number} = {},
   ) {
-    super(browser, listeners);
+    super(browser, listeners, {
+      maxPerChunk: options.maxPerChunk ?? DEFAULT_NETWORK_BUFFER_SIZE,
+      recordSizeCapBytes: options.recordSizeCapBytes,
+    });
   }
+
+  /**
+   * FR-005: estimate retained bytes from URL plus request-header values. The
+   * response body is fetched on demand and isn't held by the collector, so we
+   * only bound what would actually live in heap until the response settles.
+   */
+  protected override estimateRecordBytes(item: HTTPRequest): number {
+    let bytes = 0;
+    try {
+      bytes += item.url().length;
+      const headers = item.headers();
+      for (const [key, value] of Object.entries(headers)) {
+        bytes += key.length + (value?.length ?? 0);
+      }
+    } catch {
+      // ignore — Puppeteer may throw on detached requests.
+    }
+    return bytes;
+  }
+
   override splitAfterNavigation(page: Page) {
-    const navigations = this.storage.get(page) ?? [];
-    if (!navigations) {
+    const navigations = this.storage.get(page);
+    if (!navigations || navigations.length === 0) {
       return;
     }
 
-    const requests = navigations[0];
+    const currentChunk = navigations[0];
+    const requests = currentChunk.toArray();
 
     const lastRequestIdx = requests.findLastIndex(request => {
       return request.frame() === page.mainFrame()
@@ -387,14 +568,25 @@ export class NetworkCollector extends PageCollector<HTTPRequest> {
         : false;
     });
 
-    // Keep all requests since the last navigation request including that
-    // navigation request itself.
-    // Keep the reference
     if (lastRequestIdx !== -1) {
-      const fromCurrentNavigation = requests.splice(lastRequestIdx);
-      navigations.unshift(fromCurrentNavigation);
+      // Carry requests from the latest navigation request onward into the new
+      // chunk; preserve the rest in the historical chunk so eviction counters
+      // still reflect what happened there.
+      const carried = requests.slice(lastRequestIdx);
+      const remaining = requests.slice(0, lastRequestIdx);
+      currentChunk.replaceItems(remaining);
+
+      const newChunk = new ChunkBuffer<WithSymbolId<HTTPRequest>>(
+        this.maxPerChunk,
+      );
+      for (const item of carried) {
+        newChunk.push(item);
+      }
+      navigations.unshift(newChunk);
     } else {
-      navigations.unshift([]);
+      navigations.unshift(
+        new ChunkBuffer<WithSymbolId<HTTPRequest>>(this.maxPerChunk),
+      );
     }
     navigations.splice(this.maxNavigationSaved);
   }
